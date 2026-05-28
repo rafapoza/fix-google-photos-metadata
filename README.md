@@ -32,6 +32,20 @@ When Google Photos exports media, each photo may have an associated supplemental
    ```
 3. The container mounts `./media_items` to `/app/media_items` and executes `metadata_updater.py` automatically.
 
+### Run tests
+
+If you want to validate the filename matching logic and script imports, run locally:
+```bash
+python3 -m unittest tests.test_metadata_updater
+```
+
+Or run the tests in Docker once the image is built:
+```bash
+docker compose run --rm metadata-updater python -m unittest tests.test_metadata_updater
+```
+
+> Note: this requires the Docker image to include the `tests/` folder, which is configured in the `Dockerfile`.
+
 ## Notes
 
 - Original files are preserved in the source folders.

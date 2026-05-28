@@ -65,6 +65,60 @@ def is_exif_supported(file_path):
     """Return True for files that may support EXIF metadata."""
     return file_path.lower().endswith(('.jpg', '.jpeg'))
 
+def get_json_base_name(json_name):
+    """Extract the media base name from a Google Photos supplemental JSON file."""
+    json_name_lower = json_name.lower()
+    split_index = json_name_lower.rfind('.supplement')
+    if split_index != -1:
+        base_name = json_name[:split_index]
+    else:
+        base_name = json_name[:-5]
+    return base_name.rstrip('.')
+
+def find_associated_source_files(files, json_name):
+    """Find source files in the same folder matching the base JSON prefix."""
+    base_name = get_json_base_name(json_name)
+    lower_base = base_name.lower()
+
+    candidate_roots = {base_name}
+    if lower_base.endswith('.jpg'):
+        candidate_roots.add(base_name[:-4])
+    elif lower_base.endswith('.jpeg'):
+        candidate_roots.add(base_name[:-5])
+    else:
+        candidate_roots.add(f"{base_name}.jpg")
+        candidate_roots.add(f"{base_name}.jpeg")
+
+    if lower_base.endswith('.origin'):
+        candidate_roots.add(f"{base_name}A")
+    elif lower_base.endswith('.origina'):
+        candidate_roots.add(base_name[:-1])
+
+    allowed_remainders = {
+        '',
+        '.jpg', '.jpeg', '.mp4', '.mov', '.mp', '.png', '.heic', '.avi', '.tif', '.tiff',
+        'A', 'A.jpg', 'A.jpeg', 'A.mp4', 'A.mov', 'A.mp',
+        '-editada', '-editada.jpg', '-editada.jpeg', '-editada.mp4', '-editada.mov'
+    }
+
+    associated_files = []
+    for file_name in files:
+        if file_name == json_name or file_name.lower().endswith('.json'):
+            continue
+
+        if file_name in candidate_roots:
+            associated_files.append(file_name)
+            continue
+
+        for root in candidate_roots:
+            if file_name.startswith(root):
+                remainder = file_name[len(root):]
+                if remainder in allowed_remainders:
+                    associated_files.append(file_name)
+                    break
+
+    return sorted(set(associated_files))
+
 def update_metadata():
     if not os.path.exists(IMAGES_FOLDER):
         print(f"❌ Error: folder {IMAGES_FOLDER} does not exist.")
@@ -93,96 +147,16 @@ def update_metadata():
         for json_name in json_files:
             # Determine the associated image file name(s)
             json_name_lower = json_name.lower()
-            split_index = json_name_lower.rfind('.supplement')
-            if split_index != -1:
-                image_name = json_name[:split_index]
-            else:
-                image_name = json_name[:-5]
-            if image_name.endswith('.'):
-                image_name = image_name[:-1]
+            json_path = os.path.join(root, json_name)
+            candidate_image_names = find_associated_source_files(files, json_name)
 
-            candidate_image_names = [image_name]
-            lower_image_name = image_name.lower()
-
-            if lower_image_name.endswith('.origin'):
-                candidate_image_names.append(f"{image_name}A")
-            elif lower_image_name.endswith('.origina'):
-                candidate_image_names.append(image_name[:-1])
-
-            if lower_image_name.endswith('.jpg') or lower_image_name.endswith('.jpeg'):
-                if lower_image_name.endswith('.jpg'):
-                    base_name = image_name[:-4]
-                    ext = image_name[-4:]
-                else:
-                    base_name = image_name[:-5]
-                    ext = image_name[-5:]
-
-                if base_name not in candidate_image_names:
-                    candidate_image_names.append(base_name)
-
-                if '-editada' not in base_name.lower():
-                    edit_name = f"{base_name}-editada{ext}"
-                    if edit_name not in candidate_image_names:
-                        candidate_image_names.append(edit_name)
-                else:
-                    original_name = base_name.replace('-editada', '') + ext
-                    if original_name not in candidate_image_names:
-                        candidate_image_names.append(original_name)
-
-                if base_name.lower().endswith('.origin'):
-                    alt_name = f"{base_name}A{ext}"
-                    if alt_name not in candidate_image_names:
-                        candidate_image_names.append(alt_name)
-                elif base_name.lower().endswith('.origina'):
-                    alt_name = f"{base_name[:-1]}{ext}"
-                    if alt_name not in candidate_image_names:
-                        candidate_image_names.append(alt_name)
-            else:
-                alt_name = f"{image_name}.jpg"
-                if alt_name not in candidate_image_names:
-                    candidate_image_names.append(alt_name)
-                alt_name2 = f"{image_name}.jpeg"
-                if alt_name2 not in candidate_image_names:
-                    candidate_image_names.append(alt_name2)
-
-                if lower_image_name.endswith('.origin'):
-                    alt_name3 = f"{image_name}A.jpg"
-                    if alt_name3 not in candidate_image_names:
-                        candidate_image_names.append(alt_name3)
-                    alt_name4 = f"{image_name}A.jpeg"
-                    if alt_name4 not in candidate_image_names:
-                        candidate_image_names.append(alt_name4)
-                elif lower_image_name.endswith('.origina'):
-                    alt_name3 = f"{image_name[:-1]}.jpg"
-                    if alt_name3 not in candidate_image_names:
-                        candidate_image_names.append(alt_name3)
-                    alt_name4 = f"{image_name[:-1]}.jpeg"
-                    if alt_name4 not in candidate_image_names:
-                        candidate_image_names.append(alt_name4)
-
-            # Add special-case name variants for ORIGIN/ORIGINA pairs
-            for candidate in list(candidate_image_names):
-                lower_candidate = candidate.lower()
-                if lower_candidate.endswith('.origin'):
-                    for ext in ['.jpg', '.jpeg']:
-                        alt = f"{candidate}A{ext}"
-                        if alt not in candidate_image_names:
-                            candidate_image_names.append(alt)
-                elif lower_candidate.endswith('.origin.jpg'):
-                    alt = candidate[:-4] + 'A.jpg'
-                    if alt not in candidate_image_names:
-                        candidate_image_names.append(alt)
-                elif lower_candidate.endswith('.origin.jpeg'):
-                    alt = candidate[:-5] + 'A.jpeg'
-                    if alt not in candidate_image_names:
-                        candidate_image_names.append(alt)
+            if not candidate_image_names:
+                print(f"\n⚠️ No candidate image file found for JSON: {json_name}")
+                missing_source_files.append(os.path.relpath(json_path, IMAGES_FOLDER))
+                continue
 
             for candidate_image_name in candidate_image_names:
                 source_image_path = os.path.join(root, candidate_image_name)
-                json_path = os.path.join(root, json_name)
-                if not os.path.exists(source_image_path):
-                    continue
-
                 total_items_read += 1
                 supports_exif = is_exif_supported(source_image_path)
                 relative_media = os.path.relpath(source_image_path, IMAGES_FOLDER)

@@ -1,3 +1,5 @@
 media_items/*
 _pycache__/
 __pycache__/*
+tests/_pycache__
+tests/__pycache__/*
