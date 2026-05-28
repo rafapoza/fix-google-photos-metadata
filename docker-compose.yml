@@ -1,0 +1,7 @@
+services:
+  metadata-updater:
+    build: .
+    container_name: metadata_updater
+    volumes:
+      # Map the local folder "./media_items" to the container folder "/app/media_items"
+      - ./media_items:/app/media_items
