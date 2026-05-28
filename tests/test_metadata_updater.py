@@ -93,6 +93,17 @@ class MetadataUpdaterTest(unittest.TestCase):
         )
         self.assertEqual(associated, ['PXL_20251213_164958663.PORTRAIT.ORIGINAL.jpg'])
 
+    def test_find_associated_source_files_suppleme_json_truncated(self):
+        files = [
+            'PXL_20260419_170411344.TS-000.ABT.jpg',
+            'PXL_20260419_170411344.TS-000.ABT.jpg.suppleme.json',
+        ]
+
+        associated = self.module.find_associated_source_files(
+            files, 'PXL_20260419_170411344.TS-000.ABT.jpg.suppleme.json'
+        )
+        self.assertEqual(associated, ['PXL_20260419_170411344.TS-000.ABT.jpg'])
+
 
 if __name__ == '__main__':
     unittest.main()

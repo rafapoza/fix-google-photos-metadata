@@ -75,11 +75,20 @@ def is_exif_supported(file_path):
 def get_json_base_name(json_name):
     """Extract the media base name from a Google Photos supplemental JSON file."""
     json_name_lower = json_name.lower()
-    split_index = json_name_lower.rfind('.supplement')
-    if split_index != -1:
-        base_name = json_name[:split_index]
+    
+    # Try to find any variant starting with .supple (covers .supplement, .supplemental, .suppleme, .supplementa, etc.)
+    supple_index = -1
+    for i in range(len(json_name_lower)):
+        if json_name_lower[i:].startswith('.supple'):
+            supple_index = i
+            break
+    
+    if supple_index != -1:
+        base_name = json_name[:supple_index]
     else:
+        # Fallback: remove .json
         base_name = json_name[:-5]
+    
     return base_name.rstrip('.')
 
 def find_associated_source_files(files, json_name):
