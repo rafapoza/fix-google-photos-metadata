@@ -88,7 +88,19 @@ def find_associated_source_files(files, json_name):
     lower_base = base_name.lower()
 
     candidate_roots = {base_name}
-    if lower_base.endswith('.jpg'):
+    
+    # If base ends with suffix + extension, detect and add variants
+    if lower_base.endswith('.jpg.s'):
+        # Remove .s suffix to get the base with .jpg
+        candidate_roots.add(base_name[:-2])  # Remove .s
+        # Also add without extension
+        candidate_roots.add(base_name[:-6])  # Remove .jpg.s
+    elif lower_base.endswith('.jpeg.s'):
+        # Remove .s suffix to get the base with .jpeg
+        candidate_roots.add(base_name[:-2])  # Remove .s
+        # Also add without extension
+        candidate_roots.add(base_name[:-7])  # Remove .jpeg.s
+    elif lower_base.endswith('.jpg'):
         candidate_roots.add(base_name[:-4])
     elif lower_base.endswith('.jpeg'):
         candidate_roots.add(base_name[:-5])
@@ -105,7 +117,8 @@ def find_associated_source_files(files, json_name):
         '',
         '.jpg', '.jpeg', '.mp4', '.mov', '.mp', '.png', '.heic', '.avi', '.tif', '.tiff',
         'A', 'A.jpg', 'A.jpeg', 'A.mp4', 'A.mov', 'A.mp',
-        '-editada', '-editada.jpg', '-editada.jpeg', '-editada.mp4', '-editada.mov'
+        '-editada', '-editada.jpg', '-editada.jpeg', '-editada.mp4', '-editada.mov',
+        '.s', '.s.jpg', '.s.jpeg',  # Short suffix variants
     }
 
     associated_files = []
