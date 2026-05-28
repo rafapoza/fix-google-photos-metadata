@@ -44,6 +44,24 @@ Or run the tests in Docker once the image is built:
 docker compose run --rm metadata-updater python -m unittest tests.test_metadata_updater
 ```
 
+### Verbosity levels
+
+The script supports three verbosity levels:
+
+- `0`: silent
+- `1`: only information about missing/unprocessed destination images
+- `2`: full output (default)
+
+Run locally with a verbosity level:
+```bash
+python3 metadata_updater.py --verbose 1
+```
+
+Run with Docker and a verbosity level:
+```bash
+docker compose run --rm metadata-updater python metadata_updater.py --verbose 1
+```
+
 > Note: this requires the Docker image to include the `tests/` folder, which is configured in the `Dockerfile`.
 
 ## Notes

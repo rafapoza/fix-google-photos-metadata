@@ -1,5 +1,6 @@
 import os
 import json
+import argparse
 import piexif
 from datetime import datetime
 import pytz
@@ -11,6 +12,12 @@ IMAGES_FOLDER = "/app/media_items"
 
 # Spain timezone
 TIMEZONE = pytz.timezone('Europe/Madrid')
+
+# Verbosity levels:
+# 0 = silent
+# 1 = only missing/unprocessed destination file information
+# 2 = full output
+DEFAULT_VERBOSITY = 2
 
 def get_old_value(exif_dict, section, tag):
     """Helper to safely read and decode current metadata."""
@@ -119,12 +126,28 @@ def find_associated_source_files(files, json_name):
 
     return sorted(set(associated_files))
 
-def update_metadata():
+def parse_args():
+    parser = argparse.ArgumentParser(description='Update media metadata from Google Photos supplemental JSON files.')
+    parser.add_argument(
+        '-v', '--verbose',
+        type=int,
+        choices=[0, 1, 2],
+        default=DEFAULT_VERBOSITY,
+        help='Verbosity level: 0 = silent, 1 = only missing/unprocessed destination file info, 2 = full output'
+    )
+    return parser.parse_args()
+
+
+def update_metadata(verbosity=DEFAULT_VERBOSITY):
+    def log(message, level=2):
+        if verbosity >= level:
+            print(message)
+
     if not os.path.exists(IMAGES_FOLDER):
-        print(f"❌ Error: folder {IMAGES_FOLDER} does not exist.")
+        log(f"❌ Error: folder {IMAGES_FOLDER} does not exist.", 1)
         return
 
-    print(f"=== Starting recursive search in {IMAGES_FOLDER} ===")
+    log(f"=== Starting recursive search in {IMAGES_FOLDER} ===", 2)
 
     total_items_read = 0
     total_items_modified = 0
@@ -151,7 +174,7 @@ def update_metadata():
             candidate_image_names = find_associated_source_files(files, json_name)
 
             if not candidate_image_names:
-                print(f"\n⚠️ No candidate image file found for JSON: {json_name}")
+                log(f"\n⚠️ No candidate image file found for JSON: {json_name}", 1)
                 missing_source_files.append(os.path.relpath(json_path, IMAGES_FOLDER))
                 continue
 
@@ -165,8 +188,8 @@ def update_metadata():
                 destination_folder = f"{root} corrected"
                 destination_image_path = os.path.join(destination_folder, candidate_image_name)
                 
-                print(f"\n📸 Processing: {os.path.relpath(source_image_path, IMAGES_FOLDER)}")
-                print(f"   ↳ Destination: {os.path.relpath(destination_image_path, IMAGES_FOLDER)}")
+                log(f"\n📸 Processing: {os.path.relpath(source_image_path, IMAGES_FOLDER)}", 2)
+                log(f"   ↳ Destination: {os.path.relpath(destination_image_path, IMAGES_FOLDER)}", 2)
                 
                 # Ensure the destination folder exists before working
                 os.makedirs(destination_folder, exist_ok=True)
@@ -207,7 +230,7 @@ def update_metadata():
                         exif_data = {}
 
                     if not supports_exif:
-                        print(f"   ℹ️ Non-JPEG media file: copying and updating timestamp only...")
+                        log(f"   ℹ️ Non-JPEG media file: copying and updating timestamp only...", 2)
                         timestamp_updated = False
                         if "photoTakenTime" in json_data and isinstance(json_data["photoTakenTime"], dict):
                             try:
@@ -220,9 +243,9 @@ def update_metadata():
                                     os.utime(destination_image_path, (timestamp, timestamp))
                                     timestamp_updated = True
                                     total_items_modified += 1
-                                    print(f"   ✅ Destination file timestamp updated: {exif_date}")
+                                    log(f"   ✅ Destination file timestamp updated: {exif_date}", 2)
                             except Exception as time_error:
-                                print(f"   ❌ Error updating timestamp: {str(time_error)}")
+                                log(f"   ❌ Error updating timestamp: {str(time_error)}", 1)
                         if not timestamp_updated:
                             unmodified_media.append(relative_media)
                         continue
@@ -301,7 +324,7 @@ def update_metadata():
                         lon = float(geo_data.get("longitude", 0.0))
                         
                         if abs(lat) < 0.000001 and abs(lon) < 0.000001:
-                            print("   ⏭️ GPS data skipped because values are 0.0.")
+                            log("   ⏭️ GPS data skipped because values are 0.0.", 2)
                         else:
                             for geo_key, readable_name in gps_mappings:
                                 if geo_key in geo_data:
@@ -351,7 +374,7 @@ def update_metadata():
                                 image.save(destination_image_path, "JPEG", exif=exif_data)
                                 image.close()
                         except Exception as save_error:
-                            print(f"   ❌ Could not write EXIF to destination: {str(save_error)}")
+                            log(f"   ❌ Could not write EXIF to destination: {str(save_error)}", 1)
                             if pil_image and image:
                                 image.close()
                             continue
@@ -371,8 +394,8 @@ def update_metadata():
                                     pass
                         
                         for change in changes_made:
-                            print(f"       📝 {change['field']}: [{change['before']}] ➔ [{change['after']}]")
-                        print(f"   ✅ Image saved to corrected folder!")
+                            log(f"       📝 {change['field']}: [{change['before']}] ➔ [{change['after']}]", 2)
+                        log(f"   ✅ Image saved to corrected folder!", 2)
                     else:
                         # If no EXIF changes were applied, close the PIL image reader if open
                         if pil_image:
@@ -395,22 +418,22 @@ def update_metadata():
                                 pass
                         if not timestamp_updated:
                             unmodified_media.append(relative_media)
-                        print(f"   ⏭️ Copied without EXIF changes (already up to date), file timestamp updated.")
+                        log(f"   ⏭️ Copied without EXIF changes (already up to date), file timestamp updated.", 2)
                     
                 except Exception as e:
-                    print(f"   ❌ Error processing this image: {str(e)}")
+                    log(f"   ❌ Error processing this image: {str(e)}", 1)
 
         # After finishing this folder, ensure every processed image exists in the corrected folder
         for source_path, dest_path in processed_images:
             if not os.path.exists(dest_path):
                 relative_dest = os.path.relpath(dest_path, IMAGES_FOLDER)
-                print(f"   ⚠️ Missing corrected image, restoring from source: {relative_dest}")
+                log(f"   ⚠️ Missing corrected image, restoring from source: {relative_dest}", 1)
                 try:
                     os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                     shutil.copy2(source_path, dest_path)
-                    print(f"   ✅ Restored missing image: {relative_dest}")
+                    log(f"   ✅ Restored missing image: {relative_dest}", 1)
                 except Exception as restore_error:
-                    print(f"   ❌ Could not restore missing image: {str(restore_error)}")
+                    log(f"   ❌ Could not restore missing image: {str(restore_error)}", 1)
                     missing_images.append(relative_dest)
 
         # Also list non-JSON source files that are still missing in the corrected folder
@@ -421,24 +444,25 @@ def update_metadata():
             if not os.path.exists(destination_file_path):
                 missing_source_files.append(os.path.relpath(source_file_path, IMAGES_FOLDER))
 
-    print(f"\n=== Processing completed ===")
-    print(f"Media files read: {total_items_read}")
-    print(f"Media files modified: {total_items_modified}")
+    log(f"\n=== Processing completed ===", 2)
+    log(f"Media files read: {total_items_read}", 2)
+    log(f"Media files modified: {total_items_modified}", 2)
 
     if missing_images:
-        print("\nMissing corrected media files:")
+        log("\nMissing corrected media files:", 1)
         for missing in missing_images:
-            print(f" - {missing}")
+            log(f" - {missing}", 1)
 
     if unmodified_media:
-        print("\nMedia files read but not modified:")
+        log("\nMedia files read but not modified:", 2)
         for item in unmodified_media:
-            print(f" - {item}")
+            log(f" - {item}", 2)
 
     if missing_source_files:
-        print("\nSource files missing in corrected folders:")
+        log("\nSource files missing in corrected folders:", 1)
         for item in missing_source_files:
-            print(f" - {item}")
+            log(f" - {item}", 1)
 
 if __name__ == "__main__":
-    update_metadata()
+    args = parse_args()
+    update_metadata(args.verbose)
