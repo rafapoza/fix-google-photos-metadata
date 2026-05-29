@@ -6,6 +6,7 @@ from datetime import datetime
 import pytz
 from PIL import Image
 import shutil
+import re
 
 # Configured path for Docker environment
 IMAGES_FOLDER = "/app/media_items"
@@ -13,10 +14,15 @@ IMAGES_FOLDER = "/app/media_items"
 # Spain timezone
 TIMEZONE = pytz.timezone('Europe/Madrid')
 
-# Verbosity levels:
-# 0 = silent
-# 1 = only missing/unprocessed destination file information
-# 2 = full output
+# Media file extensions that can be processed by this script
+MEDIA_EXTENSIONS = (
+    '.jpg', '.jpeg', '.mp4', '.mov', '.mp', '.png', '.heic', '.avi', '.tif', '.tiff', '.webp', '.gif'
+)
+
+# Compile regular expressions globally to avoid loop penalties
+PXL_PATTERN = re.compile(r'(pxl_\d{8}_\d{9}|pxl_\d{8}_\d{6})')
+ARTIFACTS_PATTERN = re.compile(r'\.json$|\.supplemental$|-editada$|-edited$|\(\d+\)$', re.IGNORECASE)
+
 DEFAULT_VERBOSITY = 2
 
 def get_old_value(exif_dict, section, tag):
@@ -24,9 +30,7 @@ def get_old_value(exif_dict, section, tag):
     try:
         if section in exif_dict and tag in exif_dict[section]:
             value_bytes = exif_dict[section][tag]
-            if isinstance(value_bytes, bytes):
-                return value_bytes.decode('utf-8', errors='replace')
-            return str(value_bytes)
+            return value_bytes.decode('utf-8', errors='replace') if isinstance(value_bytes, bytes) else str(value_bytes)
     except Exception:
         pass
     return "[Not set / Empty]"
@@ -35,8 +39,7 @@ def convert_timestamp_to_exif(timestamp_str):
     """Convert a Unix timestamp to EXIF format (YYYY:MM:DD HH:MM:SS) in Spain timezone."""
     try:
         timestamp = int(timestamp_str)
-        utc_date = datetime.utcfromtimestamp(timestamp)
-        utc_date = pytz.UTC.localize(utc_date)
+        utc_date = datetime.fromtimestamp(timestamp, tz=pytz.utc)
         spain_date = utc_date.astimezone(TIMEZONE)
         return spain_date.strftime("%Y:%m:%d %H:%M:%S")
     except Exception:
@@ -46,15 +49,11 @@ def convert_gps_coordinate(decimal_coord):
     """Convert a decimal coordinate to EXIF GPS format."""
     if decimal_coord is None:
         return None
-    
-    decimal_coord = float(decimal_coord)
-    abs_coord = abs(decimal_coord)
-    
+    abs_coord = abs(float(decimal_coord))
     degrees = int(abs_coord)
     minutes_decimal = (abs_coord - degrees) * 60
     minutes = int(minutes_decimal)
     seconds = (minutes_decimal - minutes) * 60
-    
     return ((degrees, 1), (minutes, 1), (int(seconds * 1000), 1000))
 
 def sync_folder_permissions(source_folder, destination_folder):
@@ -63,8 +62,6 @@ def sync_folder_permissions(source_folder, destination_folder):
         source_stat = os.stat(source_folder)
         os.chown(destination_folder, source_stat.st_uid, source_stat.st_gid)
         os.chmod(destination_folder, source_stat.st_mode & 0o777)
-    except PermissionError:
-        pass
     except Exception:
         pass
 
@@ -72,88 +69,47 @@ def is_exif_supported(file_path):
     """Return True for files that may support EXIF metadata."""
     return file_path.lower().endswith(('.jpg', '.jpeg'))
 
-def get_json_base_name(json_name):
-    """Extract the media base name from a Google Photos supplemental JSON file."""
-    json_name_lower = json_name.lower()
+def is_media_source_file(file_name):
+    """Return True for media files that should be processed. Explicitly ignores JSON files."""
+    name_lower = file_name.lower()
+    if name_lower.endswith('.json'):
+        return False
+    return name_lower.endswith(MEDIA_EXTENSIONS)
+
+def clean_google_artifacts(name):
+    """Remove all typical Google Takeout suffixes and extensions using precompiled regex."""
+    if not name:
+        return ""
+    name_lower = name.lower()
     
-    # Try to find any variant starting with .supple (covers .supplement, .supplemental, .suppleme, .supplementa, etc.)
-    supple_index = -1
-    for i in range(len(json_name_lower)):
-        if json_name_lower[i:].startswith('.supple'):
-            supple_index = i
-            break
-    
-    if supple_index != -1:
-        base_name = json_name[:supple_index]
-    else:
-        # Fallback: remove .json
-        base_name = json_name[:-5]
-    
-    return base_name.rstrip('.')
+    # Quick removal of known media extensions
+    for ext in MEDIA_EXTENSIONS:
+        name_lower = name_lower.replace(ext, '')
+        
+    return ARTIFACTS_PATTERN.sub('', name_lower).strip()
 
-def find_associated_source_files(files, json_name):
-    """Find source files in the same folder matching the base JSON prefix."""
-    base_name = get_json_base_name(json_name)
-    lower_base = base_name.lower()
+def extract_json_data(json_path):
+    """Read JSON file and return the target filename and data dictionary."""
+    try:
+        with open(json_path, 'r', encoding='utf-8') as f:
+            json_data = json.load(f)
+    except Exception:
+        return None, None
 
-    candidate_roots = {base_name}
-    
-    # If base ends with suffix + extension, detect and add variants
-    if lower_base.endswith('.jpg.s'):
-        # Remove .s suffix to get the base with .jpg
-        candidate_roots.add(base_name[:-2])  # Remove .s
-        # Also add without extension
-        candidate_roots.add(base_name[:-6])  # Remove .jpg.s
-    elif lower_base.endswith('.jpeg.s'):
-        # Remove .s suffix to get the base with .jpeg
-        candidate_roots.add(base_name[:-2])  # Remove .s
-        # Also add without extension
-        candidate_roots.add(base_name[:-7])  # Remove .jpeg.s
-    elif lower_base.endswith('.jpg'):
-        candidate_roots.add(base_name[:-4])
-    elif lower_base.endswith('.jpeg'):
-        candidate_roots.add(base_name[:-5])
-    else:
-        candidate_roots.add(f"{base_name}.jpg")
-        candidate_roots.add(f"{base_name}.jpeg")
-
-    if lower_base.endswith('.origin'):
-        candidate_roots.add(f"{base_name}A")
-    elif lower_base.endswith('.origina'):
-        candidate_roots.add(base_name[:-1])
-
-    allowed_remainders = {
-        '',
-        '.jpg', '.jpeg', '.mp4', '.mov', '.mp', '.png', '.heic', '.avi', '.tif', '.tiff',
-        'A', 'A.jpg', 'A.jpeg', 'A.mp4', 'A.mov', 'A.mp',
-        '-editada', '-editada.jpg', '-editada.jpeg', '-editada.mp4', '-editada.mov',
-        '.s', '.s.jpg', '.s.jpeg',  # Short suffix variants
-    }
-
-    associated_files = []
-    for file_name in files:
-        if file_name == json_name or file_name.lower().endswith('.json'):
-            continue
-
-        if file_name in candidate_roots:
-            associated_files.append(file_name)
-            continue
-
-        for root in candidate_roots:
-            if file_name.startswith(root):
-                remainder = file_name[len(root):]
-                if remainder in allowed_remainders:
-                    associated_files.append(file_name)
-                    break
-
-    return sorted(set(associated_files))
+    target_filename = None
+    if isinstance(json_data, dict):
+        for key in ('title', 'fileName', 'filename', 'name'):
+            if key in json_data and isinstance(json_data[key], str) and json_data[key].strip():
+                target_filename = json_data[key].strip()
+                break
+    return target_filename, json_data
 
 def parse_args():
     parser = argparse.ArgumentParser(description='Update media metadata from Google Photos supplemental JSON files.')
     parser.add_argument(
-        '-v', '--verbose',
-        type=int,
-        choices=[0, 1, 2],
+        '-v', '--verbose', 
+        type=int, 
+        choices=[0, 1, 2], 
         default=DEFAULT_VERBOSITY,
         help='Verbosity level: 0 = silent, 1 = only missing/unprocessed destination file info, 2 = full output'
     )
@@ -176,295 +132,273 @@ def update_metadata(verbosity=DEFAULT_VERBOSITY):
     missing_images = []
     unmodified_media = []
     missing_source_files = []
+    successfully_processed_rel_paths = set()
 
-    # Walk the folder tree recursively
+    # Static GPS mapping options
+    gps_mappings = [("latitude", "Latitude"), ("longitude", "Longitude"), ("altitude", "Altitude")]
+
     for root, dirs, files in os.walk(IMAGES_FOLDER):
-        
-        # Skip folders that already contain corrected results
         if "corrected" in root:
             continue
 
-        # Filter metadata JSON files in the current folder
+        # 1. FILTER AND PRE-INDEX CURRENT FOLDER (O(1) search optimization)
         json_files = [f for f in files if f.lower().endswith('.json')]
-        processed_images = []
-        destination_folder = f"{root} corrected"
-        
-        for json_name in json_files:
-            # Determine the associated image file name(s)
-            json_name_lower = json_name.lower()
-            json_path = os.path.join(root, json_name)
-            candidate_image_names = find_associated_source_files(files, json_name)
+        if not json_files:
+            continue
 
-            if not candidate_image_names:
-                log(f"\n⚠️ No candidate image file found for JSON: {json_name}", 1)
-                missing_source_files.append(os.path.relpath(json_path, IMAGES_FOLDER))
+        media_files = [f for f in files if is_media_source_file(f)]
+        
+        # Indexed mappings for instant searches without nested loops
+        clean_media_map = {}
+        pxl_media_map = {}
+        
+        for mf in media_files:
+            cm = clean_google_artifacts(mf)
+            clean_media_map.setdefault(cm, []).append(mf)
+            
+            # Index by PXL pattern if available
+            pxl_match = PXL_PATTERN.search(cm)
+            if pxl_match:
+                pxl_media_map.setdefault(pxl_match.group(1), []).append(mf)
+
+        destination_folder = f"{root} corrected"
+        destination_folder_created = False
+        processed_images = []
+
+        # 2. PROCESS JSONs
+        for json_name in json_files:
+            json_path = os.path.join(root, json_name)
+
+            target_filename, json_data = extract_json_data(json_path)
+            if json_data is None:
                 continue
 
-            for candidate_image_name in candidate_image_names:
-                source_image_path = os.path.join(root, candidate_image_name)
-                total_items_read += 1
-                supports_exif = is_exif_supported(source_image_path)
-                relative_media = os.path.relpath(source_image_path, IMAGES_FOLDER)
+            # Resolve candidates using in-memory indexed maps (Super fast)
+            candidate_set = set()
+            clean_json = clean_google_artifacts(json_name)
+            clean_target = clean_google_artifacts(target_filename) if target_filename else ""
 
-                # Determine the destination folder by appending " corrected" to the current folder name
-                destination_folder = f"{root} corrected"
-                destination_image_path = os.path.join(destination_folder, candidate_image_name)
-                
-                log(f"\n📸 Processing: {os.path.relpath(source_image_path, IMAGES_FOLDER)}", 2)
-                log(f"   ↳ Destination: {os.path.relpath(destination_image_path, IMAGES_FOLDER)}", 2)
-                
-                # Ensure the destination folder exists before working
+            # Exact matches
+            if clean_json in clean_media_map: candidate_set.update(clean_media_map[clean_json])
+            if clean_target in clean_media_map: candidate_set.update(clean_media_map[clean_target])
+
+            # Prefix/substring quick matching
+            for cm, original_files in clean_media_map.items():
+                if (clean_target and (cm.startswith(clean_target) or clean_target.startswith(cm))) or \
+                   (cm.startswith(clean_json) or clean_json.startswith(cm)):
+                    candidate_set.update(original_files)
+
+            # Match by PXL pattern
+            json_pxl = PXL_PATTERN.search(clean_json) or (PXL_PATTERN.search(clean_target) if clean_target else None)
+            if json_pxl and json_pxl.group(1) in pxl_media_map:
+                candidate_set.update(pxl_media_map[json_pxl.group(1)])
+
+            candidate_image_names = sorted(list(candidate_set))
+
+            if not candidate_image_names:
+                if json_name.lower() not in ("metadatos.json", "metadata.json"):
+                    missing_source_files.append(os.path.relpath(json_path, IMAGES_FOLDER))
+                continue
+
+            # Ensure destination folder is created only once per active directory
+            if not destination_folder_created:
                 os.makedirs(destination_folder, exist_ok=True)
                 sync_folder_permissions(root, destination_folder)
+                destination_folder_created = True
+
+            # 3. PROCESS IDENTIFIED IMAGES
+            for candidate_image_name in candidate_image_names:
+                source_image_path = os.path.join(root, candidate_image_name)
+                destination_image_path = os.path.join(destination_folder, candidate_image_name)
+                relative_media = os.path.relpath(source_image_path, IMAGES_FOLDER)
+                
+                total_items_read += 1
+                log(f"\n📸 Processing: {relative_media}", 2)
+                log(f"   ↳ Destination: {os.path.relpath(destination_image_path, IMAGES_FOLDER)}", 2)
+
                 processed_images.append((source_image_path, destination_image_path))
 
-                # 1. Read JSON file data
-                with open(json_path, 'r', encoding='utf-8') as f:
-                    json_data = json.load(f)
-                    
                 try:
-                    # First copy the original image to the destination path to work on it
-                    # This preserves the original file intact in its source folder
                     shutil.copy2(source_image_path, destination_image_path)
                     
-                    # 2. Try loading EXIF with piexif from the destination image for supported files
-                    if supports_exif:
-                        try:
-                            exif_dict = piexif.load(destination_image_path)
-                            exif_dict.pop("thumbnail", None)
-                            using_piexif = True
-                        except Exception:
-                            using_piexif = False
-                            exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "Interop": {}}
+                    # Extract unified compatible timestamp block
+                    time_data = json_data.get("photoTakenTime") or json_data.get("creationTime") if isinstance(json_data, dict) else None
+                    supports_exif = is_exif_supported(source_image_path)
+                    
+                    # --- GENERIC FILE FLOW (Non-JPEG: GIFs, Videos, etc.) ---
+                    if not supports_exif:
+                        log(f"   ℹ️ Non-JPEG media file: copying and updating timestamp only...", 2)
+                        timestamp_updated = False
                         
-                        try:
-                            image = Image.open(destination_image_path)
-                            pil_image = True
-                            exif_data = image.getexif()
-                        except Exception:
-                            pil_image = False
-                            image = None
-                            exif_data = {}
-                    else:
+                        if time_data and isinstance(time_data, dict):
+                            timestamp_str = time_data.get("timestamp")
+                            exif_date = convert_timestamp_to_exif(timestamp_str)
+                            if exif_date:
+                                try:
+                                    date_obj = datetime.strptime(exif_date, "%Y:%m:%d %H:%M:%S")
+                                    timestamp = TIMEZONE.localize(date_obj).timestamp()
+                                    os.utime(destination_image_path, (timestamp, timestamp))
+                                    timestamp_updated = True
+                                    log(f"   ✅ Destination file timestamp updated: {exif_date}", 2)
+                                except Exception as t_err:
+                                    log(f"   ❌ Error updating timestamp: {str(t_err)}", 1)
+                        
+                        total_items_modified += 1
+                        successfully_processed_rel_paths.add(relative_media)
+                        if not timestamp_updated:
+                            log(f"   ℹ️ Copied using current filesystem time (no time key found in JSON).", 2)
+                        continue
+
+                    # --- ADVANCED EXIF METADATA FLOW (JPEGs) ---
+                    try:
+                        exif_dict = piexif.load(destination_image_path)
+                        exif_dict.pop("thumbnail", None)
+                        using_piexif = True
+                    except Exception:
                         using_piexif = False
+                        exif_dict = {"0th": {}, "Exif": {}, "GPS": {}, "1st": {}, "Interop": {}}
+                    
+                    try:
+                        image = Image.open(destination_image_path)
+                        pil_image = True
+                        exif_data = image.getexif()
+                    except Exception:
                         pil_image = False
                         image = None
                         exif_data = {}
 
-                    if not supports_exif:
-                        log(f"   ℹ️ Non-JPEG media file: copying and updating timestamp only...", 2)
-                        timestamp_updated = False
-                        if "photoTakenTime" in json_data and isinstance(json_data["photoTakenTime"], dict):
-                            try:
-                                timestamp_str = json_data["photoTakenTime"].get("timestamp")
-                                exif_date = convert_timestamp_to_exif(timestamp_str)
-                                if exif_date:
-                                    date_obj = datetime.strptime(exif_date, "%Y:%m:%d %H:%M:%S")
-                                    date_obj_tz = TIMEZONE.localize(date_obj)
-                                    timestamp = date_obj_tz.timestamp()
-                                    os.utime(destination_image_path, (timestamp, timestamp))
-                                    timestamp_updated = True
-                                    total_items_modified += 1
-                                    log(f"   ✅ Destination file timestamp updated: {exif_date}", 2)
-                            except Exception as time_error:
-                                log(f"   ❌ Error updating timestamp: {str(time_error)}", 1)
-                        if not timestamp_updated:
-                            unmodified_media.append(relative_media)
-                        continue
-
                     changes_made = []
 
-                    # --- MAPPINGS ---
-                    mappings = [
-                        (piexif.ImageIFD.ImageDescription, "descripcion", "Description"),
-                        (piexif.ImageIFD.Artist, "autor", "Author/Artist"),
-                        (piexif.ExifIFD.DateTimeOriginal, "photoTakenTime", "Capture Date")
-                    ]
-                    
-                    gps_mappings = [
-                        ("latitude", "Latitude"),
-                        ("longitude", "Longitude"),
-                        ("altitude", "Altitude")
-                    ]
-
-                    # 3. Process normal fields
-                    for exif_field, json_key, readable_name in mappings:
+                    # Validate and Inject Description and Artist
+                    for exif_field, json_key, readable_name in [(piexif.ImageIFD.ImageDescription, "descripcion", "Description"), (piexif.ImageIFD.Artist, "autor", "Author/Artist")]:
                         if json_key in json_data:
-                            if json_key == "photoTakenTime" and isinstance(json_data[json_key], dict):
-                                timestamp_str = json_data[json_key].get("timestamp")
-                                new_value = convert_timestamp_to_exif(timestamp_str)
-                                if new_value is None:
-                                    continue
-                            else:
-                                new_value = str(json_data[json_key])
+                            new_value = str(json_data[json_key])
+                            old_value = get_old_value(exif_dict, "0th", exif_field) if using_piexif else str(exif_data.get(exif_field, "[Not set / Empty]"))
                             
-                            old_value = ""
-                            if using_piexif:
-                                for section in ["0th", "Exif"]:
-                                    if exif_field in exif_dict.get(section, {}):
-                                        value_bytes = exif_dict[section][exif_field]
-                                        if isinstance(value_bytes, bytes):
-                                            old_value = value_bytes.decode('utf-8', errors='replace')
-                                        else:
-                                            old_value = str(value_bytes)
-                                        break
-                            elif pil_image:
-                                exif_data = image.getexif()
-                                if exif_field in exif_data:
-                                    old_value = str(exif_data[exif_field])
-                            
-                            if not old_value:
-                                old_value = "[Not set / Empty]"
-                            
-                            if old_value == new_value:
-                                continue
-                            
-                            if using_piexif:
-                                section = "0th" if exif_field in [piexif.ImageIFD.ImageDescription, piexif.ImageIFD.Artist, piexif.ImageIFD.DateTime] else "Exif"
-                                if section not in exif_dict:
-                                    exif_dict[section] = {}
-                                exif_dict[section][exif_field] = new_value.encode('utf-8')
-                            elif pil_image:
-                                exif_data[exif_field] = new_value
-                            
-                            if json_key == "photoTakenTime":
+                            if old_value != new_value:
                                 if using_piexif:
-                                    if "0th" not in exif_dict: exif_dict["0th"] = {}
-                                    exif_dict["0th"][piexif.ImageIFD.DateTime] = new_value.encode('utf-8')
-                                    if "Exif" not in exif_dict: exif_dict["Exif"] = {}
-                                    exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = new_value.encode('utf-8')
+                                    exif_dict["0th"][exif_field] = new_value.encode('utf-8')
                                 elif pil_image:
-                                    exif_data[piexif.ImageIFD.DateTime] = new_value
-                                    exif_data[piexif.ExifIFD.DateTimeDigitized] = new_value
-                            
-                            changes_made.append({"field": readable_name, "before": old_value, "after": new_value})
+                                    exif_data[exif_field] = new_value
+                                changes_made.append({"field": readable_name, "before": old_value, "after": new_value})
+
+                    # Validate and Inject EXIF Date
+                    if time_data and isinstance(time_data, dict):
+                        new_date = convert_timestamp_to_exif(time_data.get("timestamp"))
+                        if new_date:
+                            old_date = get_old_value(exif_dict, "Exif", piexif.ExifIFD.DateTimeOriginal) if using_piexif else "[Not set]"
+                            if old_date != new_date:
+                                if using_piexif:
+                                    exif_dict["0th"][piexif.ImageIFD.DateTime] = new_date.encode('utf-8')
+                                    exif_dict["Exif"][piexif.ExifIFD.DateTimeOriginal] = new_date.encode('utf-8')
+                                    exif_dict["Exif"][piexif.ExifIFD.DateTimeDigitized] = new_date.encode('utf-8')
+                                elif pil_image:
+                                    exif_data[piexif.ImageIFD.DateTime] = new_date
+                                    exif_data[piexif.ExifIFD.DateTimeOriginal] = new_date
+                                    exif_data[piexif.ExifIFD.DateTimeDigitized] = new_date
+                                changes_made.append({"field": "Capture Date", "before": old_date, "after": new_date})
                     
-                    # 4. Process GPS data (skip if 0.0)
+                    # Validate and Inject GPS Coordinates
                     if "geoData" in json_data and isinstance(json_data["geoData"], dict):
                         geo_data = json_data["geoData"]
-                        lat = float(geo_data.get("latitude", 0.0))
-                        lon = float(geo_data.get("longitude", 0.0))
+                        lat, lon = float(geo_data.get("latitude", 0.0)), float(geo_data.get("longitude", 0.0))
                         
-                        if abs(lat) < 0.000001 and abs(lon) < 0.000001:
-                            log("   ⏭️ GPS data skipped because values are 0.0.", 2)
-                        else:
+                        if abs(lat) > 0.000001 or abs(lon) > 0.000001:
                             for geo_key, readable_name in gps_mappings:
                                 if geo_key in geo_data:
-                                    value = float(geo_data[geo_key])
+                                    val = float(geo_data[geo_key])
                                     if geo_key == "latitude":
                                         if using_piexif:
-                                            if "GPS" not in exif_dict: exif_dict["GPS"] = {}
-                                            exif_dict["GPS"][piexif.GPSIFD.GPSLatitude] = convert_gps_coordinate(value)
-                                            exif_dict["GPS"][piexif.GPSIFD.GPSLatitudeRef] = b'N' if value >= 0 else b'S'
+                                            exif_dict["GPS"][piexif.GPSIFD.GPSLatitude] = convert_gps_coordinate(val)
+                                            exif_dict["GPS"][piexif.GPSIFD.GPSLatitudeRef] = b'N' if val >= 0 else b'S'
                                         elif pil_image:
-                                            exif_data[piexif.GPSIFD.GPSLatitude] = convert_gps_coordinate(value)
-                                            exif_data[piexif.GPSIFD.GPSLatitudeRef] = b'N' if value >= 0 else b'S'
-                                        changes_made.append({"field": f"GPS - {readable_name}", "before": "[Not set]", "after": f"{abs(value):.6f}°"})
+                                            exif_data[piexif.GPSIFD.GPSLatitude] = convert_gps_coordinate(val)
+                                            exif_data[piexif.GPSIFD.GPSLatitudeRef] = b'N' if val >= 0 else b'S'
+                                        changes_made.append({"field": f"GPS - {readable_name}", "before": "[Not set]", "after": f"{abs(val):.6f}°"})
                                     elif geo_key == "longitude":
                                         if using_piexif:
-                                            if "GPS" not in exif_dict: exif_dict["GPS"] = {}
-                                            exif_dict["GPS"][piexif.GPSIFD.GPSLongitude] = convert_gps_coordinate(value)
-                                            exif_dict["GPS"][piexif.GPSIFD.GPSLongitudeRef] = b'E' if value >= 0 else b'W'
+                                            exif_dict["GPS"][piexif.GPSIFD.GPSLongitude] = convert_gps_coordinate(val)
+                                            exif_dict["GPS"][piexif.GPSIFD.GPSLongitudeRef] = b'E' if val >= 0 else b'W'
                                         elif pil_image:
-                                            exif_data[piexif.GPSIFD.GPSLongitude] = convert_gps_coordinate(value)
-                                            exif_data[piexif.GPSIFD.GPSLongitudeRef] = b'E' if value >= 0 else b'W'
-                                        changes_made.append({"field": f"GPS - {readable_name}", "before": "[Not set]", "after": f"{abs(value):.6f}°"})
+                                            exif_data[piexif.GPSIFD.GPSLongitude] = convert_gps_coordinate(val)
+                                            exif_data[piexif.GPSIFD.GPSLongitudeRef] = b'E' if val >= 0 else b'W'
+                                        changes_made.append({"field": f"GPS - {readable_name}", "before": "[Not set]", "after": f"{abs(val):.6f}°"})
                                     elif geo_key == "altitude":
                                         if using_piexif:
-                                            if "GPS" not in exif_dict: exif_dict["GPS"] = {}
-                                            exif_dict["GPS"][piexif.GPSIFD.GPSAltitude] = convert_gps_coordinate(value)
+                                            exif_dict["GPS"][piexif.GPSIFD.GPSAltitude] = convert_gps_coordinate(val)
                                             exif_dict["GPS"][piexif.GPSIFD.GPSAltitudeRef] = b'\x00'
                                         elif pil_image:
-                                            exif_data[piexif.GPSIFD.GPSAltitude] = convert_gps_coordinate(value)
+                                            exif_data[piexif.GPSIFD.GPSAltitude] = convert_gps_coordinate(val)
                                             exif_data[piexif.GPSIFD.GPSAltitudeRef] = b'\x00'
-                                        changes_made.append({"field": f"GPS - {readable_name}", "before": "[Not set]", "after": f"{value}m"})
+                                        changes_made.append({"field": f"GPS - {readable_name}", "before": "[Not set]", "after": f"{val}m"})
 
-                    # 5. Save the modified image to the destination path
                     if changes_made:
-                        try:
-                            if using_piexif:
-                                try:
-                                    exif_dict.pop("thumbnail", None)
-                                    exif_bytes = piexif.dump(exif_dict)
-                                except Exception:
-                                    exif_dict.pop("1st", None)
-                                    exif_dict.pop("Interop", None)
-                                    exif_bytes = piexif.dump(exif_dict)
-                                
-                                piexif.insert(exif_bytes, destination_image_path)
-                            elif pil_image:
-                                image.save(destination_image_path, "JPEG", exif=exif_data)
-                                image.close()
-                        except Exception as save_error:
-                            log(f"   ❌ Could not write EXIF to destination: {str(save_error)}", 1)
-                            if pil_image and image:
-                                image.close()
-                            continue
+                        if using_piexif:
+                            try:
+                                piexif.insert(piexif.dump(exif_dict), destination_image_path)
+                            except Exception:
+                                exif_dict.pop("1st", None); exif_dict.pop("Interop", None)
+                                piexif.insert(piexif.dump(exif_dict), destination_image_path)
+                        elif pil_image:
+                            image.save(destination_image_path, "JPEG", exif=exif_data)
+                            image.close()
 
                         total_items_modified += 1
+                        successfully_processed_rel_paths.add(relative_media)
                         
-                        # Synchronize the physical file timestamp for corrected file
+                        # Synchronize physical file timestamp for modified files
                         for change in changes_made:
                             if change['field'] == 'Capture Date':
                                 try:
-                                    date_str = change['after']
-                                    date_obj = datetime.strptime(date_str, "%Y:%m:%d %H:%M:%S")
-                                    date_obj_tz = TIMEZONE.localize(date_obj)
-                                    timestamp = date_obj_tz.timestamp()
+                                    date_obj = datetime.strptime(change['after'], "%Y:%m:%d %H:%M:%S")
+                                    timestamp = TIMEZONE.localize(date_obj).timestamp()
                                     os.utime(destination_image_path, (timestamp, timestamp))
-                                except Exception:
-                                    pass
+                                except Exception: pass
                         
-                        for change in changes_made:
-                            log(f"       📝 {change['field']}: [{change['before']}] ➔ [{change['after']}]", 2)
+                        for ch in changes_made:
+                            log(f"       📝 {ch['field']}: [{ch['before']}] ➔ [{ch['after']}]", 2)
                         log(f"   ✅ Image saved to corrected folder!", 2)
                     else:
-                        # If no EXIF changes were applied, close the PIL image reader if open
-                        if pil_image:
-                            image.close()
+                        if pil_image: image.close()
                         
-                        # Still force the correct file timestamp on the copied image if JSON provides it
-                        timestamp_updated = False
-                        if "photoTakenTime" in json_data and isinstance(json_data["photoTakenTime"], dict):
-                            try:
-                                timestamp_str = json_data["photoTakenTime"].get("timestamp")
-                                exif_date = convert_timestamp_to_exif(timestamp_str)
-                                if exif_date:
+                        # Update physical timestamp even if internal EXIF metadata was already up to date
+                        if time_data and isinstance(time_data, dict):
+                            exif_date = convert_timestamp_to_exif(time_data.get("timestamp"))
+                            if exif_date:
+                                try:
                                     date_obj = datetime.strptime(exif_date, "%Y:%m:%d %H:%M:%S")
-                                    date_obj_tz = TIMEZONE.localize(date_obj)
-                                    timestamp = date_obj_tz.timestamp()
+                                    timestamp = TIMEZONE.localize(date_obj).timestamp()
                                     os.utime(destination_image_path, (timestamp, timestamp))
-                                    timestamp_updated = True
-                                    total_items_modified += 1
-                            except Exception:
-                                pass
-                        if not timestamp_updated:
-                            unmodified_media.append(relative_media)
+                                except Exception: pass
+                                
+                        total_items_modified += 1
+                        successfully_processed_rel_paths.add(relative_media)
                         log(f"   ⏭️ Copied without EXIF changes (already up to date), file timestamp updated.", 2)
                     
                 except Exception as e:
                     log(f"   ❌ Error processing this image: {str(e)}", 1)
 
-        # After finishing this folder, ensure every processed image exists in the corrected folder
+        # 4. POST-PROCESSING FOLDER VERIFICATION
         for source_path, dest_path in processed_images:
             if not os.path.exists(dest_path):
                 relative_dest = os.path.relpath(dest_path, IMAGES_FOLDER)
                 log(f"   ⚠️ Missing corrected image, restoring from source: {relative_dest}", 1)
                 try:
-                    os.makedirs(os.path.dirname(dest_path), exist_ok=True)
                     shutil.copy2(source_path, dest_path)
-                    log(f"   ✅ Restored missing image: {relative_dest}", 1)
-                except Exception as restore_error:
-                    log(f"   ❌ Could not restore missing image: {str(restore_error)}", 1)
+                except Exception:
                     missing_images.append(relative_dest)
 
-        # Also list non-JSON source files that are still missing in the corrected folder
-        source_files = [f for f in files if not f.lower().endswith('.json')]
-        for file_name in source_files:
+        # Report missing or unmodified items based on pre-indexed sets
+        for file_name in media_files:
             source_file_path = os.path.join(root, file_name)
             destination_file_path = os.path.join(destination_folder, file_name)
+            relative_media = os.path.relpath(source_file_path, IMAGES_FOLDER)
+            
             if not os.path.exists(destination_file_path):
-                missing_source_files.append(os.path.relpath(source_file_path, IMAGES_FOLDER))
+                missing_source_files.append(relative_media)
+            elif relative_media not in successfully_processed_rel_paths:
+                if relative_media not in unmodified_media:
+                    unmodified_media.append(relative_media)
 
     log(f"\n=== Processing completed ===", 2)
     log(f"Media files read: {total_items_read}", 2)
@@ -472,18 +406,15 @@ def update_metadata(verbosity=DEFAULT_VERBOSITY):
 
     if missing_images:
         log("\nMissing corrected media files:", 1)
-        for missing in missing_images:
-            log(f" - {missing}", 1)
+        for missing in missing_images: log(f" - {missing}", 1)
 
     if unmodified_media:
         log("\nMedia files read but not modified:", 2)
-        for item in unmodified_media:
-            log(f" - {item}", 2)
+        for item in sorted(list(set(unmodified_media))): log(f" - {item}", 2)
 
     if missing_source_files:
         log("\nSource files missing in corrected folders:", 1)
-        for item in missing_source_files:
-            log(f" - {item}", 1)
+        for item in sorted(list(set(missing_source_files))): log(f" - {item}", 1)
 
 if __name__ == "__main__":
     args = parse_args()

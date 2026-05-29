@@ -7,10 +7,11 @@ When Google Photos exports media, each photo may have an associated supplemental
 ## Features
 
 - Detects Google Photos supplemental metadata files.
-- Maps JSON data back into image EXIF metadata.
-- Supports JPEG images and timestamp correction for other media.
-- Creates a parallel `... corrected` folder to preserve originals.
-- Handles many filename variants produced by Google Photos exports.
+- High-performance $O(1)$ in-memory indexing to instantly match JSON files with their respective media assets without nested loop penalties.
+- Maps JSON data back into image EXIF metadata (Description, Artist, Capture Date, and GPS Coordinates).
+- Supports JPEG images and hardware/filesystem timestamp correction for other media (Videos, GIFs, PNGs).
+- Creates a parallel `... corrected` folder to preserve originals and syncs directory permissions.
+- Handles many filename variants produced by Google Photos exports (such as `-edited`, `-editada`, and duplicate indices like `(1 `).
 
 ## Usage
 
@@ -46,7 +47,7 @@ docker compose run --rm metadata-updater python -m unittest tests.test_metadata_
 
 ### Verbosity levels
 
-The script supports three verbosity levels:
+The script supports three verbosity levels via the `-v` or `--verbose` arguments:
 
 - `0`: silent
 - `1`: only information about missing/unprocessed destination images
@@ -62,12 +63,11 @@ Run with Docker and a verbosity level:
 docker compose run --rm metadata-updater python metadata_updater.py --verbose 1
 ```
 
-> Note: this requires the Docker image to include the `tests/` folder, which is configured in the `Dockerfile`.
+> Note: running tests or custom commands requires the Docker container to map or include the script structure, which is handled via volume mounts or the `Dockerfile`.
 
 ## Notes
 
-- Original files are preserved in the source folders.
+- Original files are strictly preserved in their source folders.
 - Corrected files are written into sibling folders named like `Fotos del 2023 corrected`.
-- If a file is already up to date, it will be copied and timestamped accordingly.
-- The script is designed to handle many Google Photos JSON naming variants, including `supplemental-met.json`, `supplemental-meta.json`, and other export irregularities.
-
+- If a file is already up to date, it will be copied and its physical filesystem timestamp (`mtime`) will be adjusted to match the capture time.
+- The script uses precompiled regular expressions to handle aggressive Google Photos patterns seamlessly.
